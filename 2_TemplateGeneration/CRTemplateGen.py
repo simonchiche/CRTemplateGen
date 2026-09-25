@@ -4,12 +4,16 @@ import argparse
 from pathlib import Path
 import numpy as np
 import glob
+from MainModules.ShowerClass import CreateShowerfromHDF5
+from XmaxParam.GetAirXmaxPos import getXmaxPosition, Xmax_param_QGSJETII
+from XmaxParam.AirDensityParam import rho_corsika
+import sys
+from copy import deepcopy
 
 
 # Configuration, separate from the target shower parameters.
 LIBRARY_PATH = Path("/Users/chiche/Desktop/DeepCrAnalysis/Simulations/FullDenseDeepCr")
 OUTPUT_PATH = Path("/Users/chiche/Desktop/CRTemplateGen/2_TemplateGeneration/CRTemplates")
-
 
 
 def GetSimParameters(SimPath):
@@ -34,10 +38,6 @@ def find_closest_simulation(primary, energy, theta, phi, LIBRARY_PATH):
     
     E_sim, theta_sim, phi_sim, Simfiles = GetSimParameters(LIBRARY_PATH)
 
-
-    E_sel = E_sim[np.argmin(abs(E_sim-energy))]
-
-
     # 1. Closest available zenith
     theta_sel = theta_sim[np.argmin(np.abs(theta_sim - theta))]
 
@@ -45,39 +45,91 @@ def find_closest_simulation(primary, energy, theta, phi, LIBRARY_PATH):
     selzen_sims = np.flatnonzero(theta_sim == theta_sel)
 
     # 3. Closest energy among those simulations
-    idx_Esel = selzen_sims[np.argmin(np.abs(E_sim[selzen_sims] - E))]
+    idx_Esel = selzen_sims[np.argmin(np.abs(E_sim[selzen_sims] - energy))]
 
     # 4. Return the actual file, preserving its full path
     return Path(Simfiles[idx_Esel])
 
 
-def load_reference_simulation(simulation_path):
-    """Load reference metadata, antenna positions and both sets of traces.
+def GeomagneticFactor(zenith, azimuth):
 
-    Expected result: a dict with primary, energy, zenith, azimuth,
-    antenna_positions, traces_air and traces_ice. Each trace collection maps
-    antenna IDs to arrays with columns [time, Ex, Ey, Ez]. Positions in metres
-    must use the same antenna IDs. Additional physical metadata may be needed.
+    azimuth = 0*np.pi/180
+    zenith = zenith*np.pi/180
+    Bgeo = np.array([7.705, 0, -54.111])
+
+    uB = Bgeo/np.linalg.norm(Bgeo)
+    uv = np.array([np.sin(zenith)*np.cos(azimuth), np.sin(zenith)*np.sin(azimuth), -np.cos(zenith)])
+    
+    sin_alpha = np.sin(np.arccos(np.dot(uv, uB)))
+
+    return sin_alpha
+
+def GetGeomagneticScale(RefSim, target_zenith, target_azimuth):
+
+    sin_target = GeomagneticFactor(target_zenith, target_azimuth)
+    sin_reference = GeomagneticFactor(RefSim.zenith, RefSim.azimuth)
+
+    #print(np.degrees(np.arcsin(sin_target)), "target geomagnetic angle")
+    #print(np.degrees(np.arcsin(sin_reference)), "reference geomagnetic angle")
+
+    return (sin_target / sin_reference)**2
+
+
+
+def GetXmaxParams(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth):
+
+    # Target shower Xmax air density and distance from shower core
+    Xmax_target = Xmax_param_QGSJETII(target_energy*1e18, MassNumber, fluctuations=True)[0]
+    XmaxPos_target, Dxmax_target = getXmaxPosition(target_azimuth, target_zenith, \
+                                                   glevel=3216, injection=1e6, showerDistance=0, Xmax_primary =Xmax_target)
+    rhoXmax_target = rho_corsika(XmaxPos_target[2])
+
+    TargetSim.xmax = Xmax_target
+    TargetSim.xmaxdist = Dxmax_target
+
+    # Reference shower Xmax air density and distance from shower core
+    XmaxPos_ref = getXmaxPosition(RefSim.azimuth, RefSim.zenith, \
+                                                   glevel=3216, injection=1e6, showerDistance=0, Xmax_primary=RefSim.xmax)[0]
+    Dxmax_ref = RefSim.xmaxdist
+    rhoXmax_ref = rho_corsika(XmaxPos_ref[2])
+
+    return rhoXmax_ref, rhoXmax_target, Dxmax_ref, Dxmax_target
+
+ #(rhoXmax_ref/ rhoXmax_target)**2
+
+def GetIceXmaxDistScale(Dxmax_ref, Dxmax_target):
+    """Return the scaling factor for the ice component based on Xmax distances.
+
     """
-    # TODO: Connect the existing HDF5 reader / Shower implementation.
-    # TODO: Preserve antenna identity and check units and coordinate conventions.
-    raise NotImplementedError("Reference simulation loading is TODO.")
+    Lambda = 1680 # in meters, fitted attenuation legnth due to propgatin in the atmosphere
+
+    return np.exp(-2*Dxmax_target/Lambda)/np.exp(-2*Dxmax_ref/Lambda)
+
+def get_scaling_factors(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth):
+
+    rhoXmax_ref, rhoXmax_target, Dxmax_ref, Dxmax_target = \
+        GetXmaxParams(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth)
+
+    EnergyScale = (target_energy / RefSim.energy)**2
+
+    GeoScale = GetGeomagneticScale(RefSim, target_zenith, target_azimuth)
+
+    AirDensityScale = (rhoXmax_ref / rhoXmax_target) ** 2
+
+    IceXmaxDistScale = GetIceXmaxDistScale(Dxmax_ref, Dxmax_target)
+
+    scaling_factors = {
+        "energy": EnergyScale,
+        "geomagnetic": GeoScale,
+        "air_density": AirDensityScale,
+        "XmaxDist": IceXmaxDistScale
+    }
+
+    return scaling_factors
 
 
-def get_scaling_factors(reference, primary, energy, zenith, azimuth):
-    """Return separate electric-field amplitude factors for air and ice.
 
-    Expected result: a dict with 'air' and 'ice' entries.
-    """
-    # TODO: Compute the required target/reference shower properties (Xmax,
-    # distance to Xmax, air density and geomagnetic angle).
-    # TODO: Evaluate the radiation-energy scaling laws with calibrated parameters.
-    # TODO: Derive amplitude factors from the square root of the target/reference
-    # radiation-energy ratios, checking the assumptions about footprint geometry.
-    raise NotImplementedError("Electric-field scaling factors are TODO.")
-
-
-def scale_electric_field(reference, scaling_factors, primary, energy, zenith, azimuth):
+def scale_electric_field(RefSim, TargetSim, scaling_factors, primary, energy, zenith, azimuth):
     """Return antenna_positions, traces_air and traces_ice for the target.
 
     Each returned collection must retain consistent antenna IDs. Reference
@@ -87,7 +139,43 @@ def scale_electric_field(reference, scaling_factors, primary, energy, zenith, az
     # and timing changes required by the target geometry.
     # TODO: Apply the air and ice amplitude factors to electric-field components.
     # TODO: Return the target positions and the two trace dictionaries.
+
+    Escale, GeoScale, AirDensityScale, IceXmaxDistScale = (
+        scaling_factors["energy"],
+        scaling_factors["geomagnetic"],
+        scaling_factors["air_density"],
+        scaling_factors["XmaxDist"],
+    )
+
+    AirScale = np.sqrt(Escale * GeoScale * AirDensityScale)
+    IceScale = np.sqrt(Escale * IceXmaxDistScale)
+
+    TargetSim.traces_C = {ant_id: AirScale * RefSim.traces_C[ant_id] for ant_id in RefSim.traces_C}
+    TargetSim.traces_G = {ant_id: IceScale * RefSim.traces_G[ant_id] for ant_id in RefSim.traces_G}
+
+
     raise NotImplementedError("Electric-field template scaling is TODO.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def save_template(template, output_path):
@@ -115,11 +203,19 @@ def generate_template(primary, energy, zenith, azimuth, Save=False):
     simulation_path = find_closest_simulation(
         primary, energy, zenith, azimuth, LIBRARY_PATH
     )
-    reference = load_reference_simulation(simulation_path)
-    scaling_factors = get_scaling_factors(reference, primary, energy, zenith, azimuth)
+    RefSim = CreateShowerfromHDF5(simulation_path)
+    
+    TargetSim = deepcopy(RefSim) 
+    TargetSim.energy, TargetSim.zenith, TargetSim.azimuth = energy, zenith, azimuth
+
+    scaling_factors = get_scaling_factors(RefSim, TargetSim, primary, energy, zenith, azimuth)
+
     positions, traces_air, traces_ice = scale_electric_field(
-        reference, scaling_factors, primary, energy, zenith, azimuth
+        RefSim, TargetSim, scaling_factors, primary, energy, zenith, azimuth
     )
+
+    sys.exit()
+
 
     template = {
         "primary": primary,
@@ -141,6 +237,10 @@ def generate_template(primary, energy, zenith, azimuth, Save=False):
     return template
 
 
+generate_template(1, 0.316, 28, 0, Save=False)
+
+
+'''
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--primary", required=True)
@@ -156,3 +256,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
