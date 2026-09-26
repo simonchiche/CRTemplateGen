@@ -53,14 +53,14 @@ def find_closest_simulation(primary, energy, theta, phi, LIBRARY_PATH):
 
 def GeomagneticFactor(zenith, azimuth):
 
-    azimuth = 0*np.pi/180
+    azimuth = azimuth*np.pi/180
     zenith = zenith*np.pi/180
     Bgeo = np.array([7.705, 0, -54.111])
 
     uB = Bgeo/np.linalg.norm(Bgeo)
     uv = np.array([np.sin(zenith)*np.cos(azimuth), np.sin(zenith)*np.sin(azimuth), -np.cos(zenith)])
     
-    sin_alpha = np.sin(np.arccos(np.dot(uv, uB)))
+    sin_alpha =  np.linalg.norm(np.cross(uv, uB))
 
     return sin_alpha
 
@@ -69,6 +69,11 @@ def GetGeomagneticScale(RefSim, target_zenith, target_azimuth):
     sin_target = GeomagneticFactor(target_zenith, target_azimuth)
     sin_reference = GeomagneticFactor(RefSim.zenith, RefSim.azimuth)
 
+    if sin_reference < 1e-8:
+        raise ValueError(
+            "Reference shower is too closely aligned with the magnetic field."
+        )
+
     #print(np.degrees(np.arcsin(sin_target)), "target geomagnetic angle")
     #print(np.degrees(np.arcsin(sin_reference)), "reference geomagnetic angle")
 
@@ -76,10 +81,10 @@ def GetGeomagneticScale(RefSim, target_zenith, target_azimuth):
 
 
 
-def GetXmaxParams(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth):
+def GetXmaxParams(RefSim, TargetSim, target_energy, target_zenith, target_azimuth, fluctuations):
 
     # Target shower Xmax air density and distance from shower core
-    Xmax_target = Xmax_param_QGSJETII(target_energy*1e18, MassNumber, fluctuations=True)[0]
+    Xmax_target = Xmax_param_QGSJETII(target_energy*1e18, TargetSim.GetMassNumber(), fluctuations)[0]
     XmaxPos_target, Dxmax_target = getXmaxPosition(target_azimuth, target_zenith, \
                                                    glevel=3216, injection=1e6, showerDistance=0, Xmax_primary =Xmax_target)
     rhoXmax_target = rho_corsika(XmaxPos_target[2])
@@ -103,12 +108,12 @@ def GetIceXmaxDistScale(Dxmax_ref, Dxmax_target):
     """
     Lambda = 1680 # in meters, fitted attenuation legnth due to propgatin in the atmosphere
 
-    return np.exp(-2*Dxmax_target/Lambda)/np.exp(-2*Dxmax_ref/Lambda)
+    return np.exp(-2 * (Dxmax_target - Dxmax_ref) / Lambda)
 
-def get_scaling_factors(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth):
+def get_scaling_factors(RefSim, TargetSim, target_energy, target_zenith, target_azimuth, fluctuations=True):
 
     rhoXmax_ref, rhoXmax_target, Dxmax_ref, Dxmax_target = \
-        GetXmaxParams(RefSim, TargetSim, MassNumber, target_energy, target_zenith, target_azimuth)
+        GetXmaxParams(RefSim, TargetSim, target_energy, target_zenith, target_azimuth, fluctuations)
 
     EnergyScale = (target_energy / RefSim.energy)**2
 
@@ -128,17 +133,28 @@ def get_scaling_factors(RefSim, TargetSim, MassNumber, target_energy, target_zen
     return scaling_factors
 
 
+def RotateAntennaPos(AntPos, ref_azimuth, target_azimuth):
+    """Rotate positions around the z-axis; angle in degrees."""
+    delta_azimuth = target_azimuth - ref_azimuth
+    angle = np.deg2rad(delta_azimuth)
 
-def scale_electric_field(RefSim, TargetSim, scaling_factors, primary, energy, zenith, azimuth):
-    """Return antenna_positions, traces_air and traces_ice for the target.
+    rotation_matrix = np.array([
+        [np.cos(angle), -np.sin(angle)],
+        [np.sin(angle),  np.cos(angle)],
+    ])
 
-    Each returned collection must retain consistent antenna IDs. Reference
-    arrays must remain unchanged so they can be reused for another event.
+    rotated = np.array(AntPos, dtype=float, copy=True)
+    rotated[:, :2] = rotated[:, :2] @ rotation_matrix.T
+    return rotated
+
+
+def scale_electric_field(RefSim, TargetSim, scaling_factors):
+    """Return scaled target shower
     """
     # TODO: Define any coordinate/polarization rotations, footprint transformations
     # and timing changes required by the target geometry.
-    # TODO: Apply the air and ice amplitude factors to electric-field components.
-    # TODO: Return the target positions and the two trace dictionaries.
+
+    TargetSim.pos = RotateAntennaPos(TargetSim.pos, RefSim.azimuth, TargetSim.azimuth)
 
     Escale, GeoScale, AirDensityScale, IceXmaxDistScale = (
         scaling_factors["energy"],
@@ -150,31 +166,14 @@ def scale_electric_field(RefSim, TargetSim, scaling_factors, primary, energy, ze
     AirScale = np.sqrt(Escale * GeoScale * AirDensityScale)
     IceScale = np.sqrt(Escale * IceXmaxDistScale)
 
-    TargetSim.traces_C = {ant_id: AirScale * RefSim.traces_C[ant_id] for ant_id in RefSim.traces_C}
-    TargetSim.traces_G = {ant_id: IceScale * RefSim.traces_G[ant_id] for ant_id in RefSim.traces_G}
+    for trace in TargetSim.traces_c.values():
+            trace[:, 1:] *= AirScale
 
-
-    raise NotImplementedError("Electric-field template scaling is TODO.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    for trace in TargetSim.traces_g.values():
+            trace[:, 1:] *= IceScale
+    
+    return TargetSim
+    
 
 
 
@@ -185,7 +184,7 @@ def save_template(template, output_path):
     raise NotImplementedError("Template serialization is TODO.")
 
 
-def generate_template(primary, energy, zenith, azimuth, Save=False):
+def generate_template(primary, energy, zenith, azimuth, fluctuations=True, Save=False):
     """Select a reference, scale its traces and optionally save the result.
 
     Parameters
@@ -206,38 +205,20 @@ def generate_template(primary, energy, zenith, azimuth, Save=False):
     RefSim = CreateShowerfromHDF5(simulation_path)
     
     TargetSim = deepcopy(RefSim) 
-    TargetSim.energy, TargetSim.zenith, TargetSim.azimuth = energy, zenith, azimuth
+    TargetSim.energy, TargetSim.zenith, TargetSim.azimuth, TargetSim.primary = energy, zenith, azimuth, primary
 
-    scaling_factors = get_scaling_factors(RefSim, TargetSim, primary, energy, zenith, azimuth)
+    scaling_factors = get_scaling_factors(RefSim, TargetSim, energy, zenith, azimuth, fluctuations)
 
-    positions, traces_air, traces_ice = scale_electric_field(
-        RefSim, TargetSim, scaling_factors, primary, energy, zenith, azimuth
-    )
+    TargetSim = scale_electric_field(RefSim, TargetSim, scaling_factors)
 
     sys.exit()
 
-
-    template = {
-        "primary": primary,
-        "energy": energy,
-        "zenith": zenith,
-        "azimuth": azimuth,
-        "reference_simulation": str(simulation_path),
-        "scaling_factors": scaling_factors,
-        "antenna_positions": positions,
-        "traces_air": traces_air,
-        "traces_ice": traces_ice,
-        "units": {
-            "energy": "EeV", "angles": "deg", "positions": "m",
-            "time": "s", "electric_field": "microvolt/m",
-        },
-    }
     if Save:
         save_template(template, OUTPUT_PATH)
     return template
 
 
-generate_template(1, 0.316, 28, 0, Save=False)
+generate_template("Proton", 0.316, 28, 0, fluctuations=True, Save=False)
 
 
 '''

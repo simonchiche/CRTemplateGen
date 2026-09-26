@@ -170,7 +170,7 @@ def getXmaxPosition(azimuth, zenith, glevel, injection, showerDistance, Xmax_pri
 
     
     uv = showerdirection(zenith, azimuth)
-    print(Xmax_primary)
+    print(Xmax_primary, "Xmax primary")
     if(Xmax_primary != 0):
         showerDistance = getGroundXmaxDistance(Xmax_primary, zenith, glevel, injection)
     

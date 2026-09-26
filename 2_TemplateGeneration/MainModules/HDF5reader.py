@@ -108,6 +108,12 @@ def GetPrimaryFromHdf5(HDF5filepath):
         prim_id = input_attrs['PrimaryParticleType']
         if(prim_id == 14):
             Primary = "Proton"
+        elif(prim_id == 402):
+            Primary = "Helium"
+        elif(prim_id == 1407):
+            Primary = "Nitrogen"
+        elif(prim_id == 5626):
+            Primary = "Iron"
         else:
             Primary = "Undefined"
     return Primary

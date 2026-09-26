@@ -56,6 +56,18 @@ class Shower:
         
         return uv
     
+    def GetMassNumber(self):
+        if(self.primary == "Proton"):
+            A = 1
+        if(self.primary == "Helium"):
+            A = 4
+        if(self.primary == "Nitrogen"):
+            A = 14
+        if(self.primary == "Iron"):
+            A = 56
+        
+        return A
+    
     def GetDepths(self):
         
         Pos = self.pos
